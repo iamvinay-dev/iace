@@ -1,4 +1,6 @@
 import os
+import hmac
+import hashlib
 from functools import wraps
 
 import psycopg2
@@ -13,6 +15,7 @@ WA_TOKEN = os.environ.get("WHATSAPP_TOKEN", "")
 PHONE_ID = os.environ.get("PHONE_NUMBER_ID", "")
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "admin123")
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
+META_APP_SECRET = os.environ.get("META_APP_SECRET", "")  # optional but recommended
 
 # ---------------- COURSES (from the IACE fee sheet) ----------------
 COURSES = [
@@ -58,7 +61,8 @@ def reply_for(text):
 
 # ---------------- DATABASE ----------------
 def q(sql, params=(), fetch=False):
-    conn = psycopg2.connect(DATABASE_URL)
+    # connect_timeout stops a dead database from freezing the request
+    conn = psycopg2.connect(DATABASE_URL, connect_timeout=5)
     try:
         with conn, conn.cursor() as cur:
             cur.execute(sql, params)
@@ -78,26 +82,50 @@ def init_db():
 
 
 def log(phone, name, direction, text):
-    q(
-        "INSERT INTO messages(phone,name,direction,text) VALUES (%s,%s,%s,%s)",
-        (phone, name, direction, text),
-    )
+    """Save a message. A database problem must NEVER stop the bot from replying."""
+    try:
+        q(
+            "INSERT INTO messages(phone,name,direction,text) VALUES (%s,%s,%s,%s)",
+            (phone, name, direction, text),
+        )
+    except Exception as e:
+        print("log failed:", e)
 
 
 # ---------------- WHATSAPP ----------------
 def send(to, text):
-    requests.post(
-        f"https://graph.facebook.com/v21.0/{PHONE_ID}/messages",
-        headers={"Authorization": f"Bearer {WA_TOKEN}"},
-        json={
-            "messaging_product": "whatsapp",
-            "to": to,
-            "type": "text",
-            "text": {"body": text},
-        },
-        timeout=15,
-    )
+    if not WA_TOKEN or not PHONE_ID:
+        print("send skipped: WHATSAPP_TOKEN or PHONE_NUMBER_ID is not set")
+        return
+    try:
+        r = requests.post(
+            f"https://graph.facebook.com/v21.0/{PHONE_ID}/messages",
+            headers={"Authorization": f"Bearer {WA_TOKEN}"},
+            json={
+                "messaging_product": "whatsapp",
+                "to": to,
+                "type": "text",
+                "text": {"body": text[:4000]},
+            },
+            timeout=15,
+        )
+        if r.status_code >= 400:
+            # shows expired token (401), recipient not allowed (131030), etc.
+            print("send failed:", r.status_code, r.text[:300])
+    except Exception as e:
+        print("send exception:", type(e).__name__)
     log(to, None, "out", text)
+
+
+def signature_ok(raw_body):
+    """If META_APP_SECRET is set, only accept requests really signed by Meta."""
+    if not META_APP_SECRET:
+        return True
+    header = request.headers.get("X-Hub-Signature-256", "")
+    expected = "sha256=" + hmac.new(
+        META_APP_SECRET.encode(), raw_body, hashlib.sha256
+    ).hexdigest()
+    return hmac.compare_digest(header, expected)
 
 
 @app.route("/")
@@ -107,9 +135,9 @@ def home():
 
 @app.route("/webhook", methods=["GET"])
 def verify():
-    if (
-        request.args.get("hub.mode") == "subscribe"
-        and request.args.get("hub.verify_token") == VERIFY_TOKEN
+    token = request.args.get("hub.verify_token", "")
+    if request.args.get("hub.mode") == "subscribe" and hmac.compare_digest(
+        token.encode(), VERIFY_TOKEN.encode()
     ):
         return request.args.get("hub.challenge", ""), 200
     return "Forbidden", 403
@@ -117,6 +145,11 @@ def verify():
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
+    raw = request.get_data()
+    if not signature_ok(raw):
+        print("webhook rejected: bad signature")
+        return "Forbidden", 403
+
     data = request.get_json(silent=True) or {}
     try:
         value = data["entry"][0]["changes"][0]["value"]
@@ -126,8 +159,8 @@ def webhook():
             phone = m["from"]
             name = (value.get("contacts") or [{}])[0].get("profile", {}).get("name")
             text = m.get("text", {}).get("body", "[non-text message]")
-            log(phone, name, "in", text)
-            send(phone, reply_for(text))
+            send(phone, reply_for(text))   # reply FIRST
+            log(phone, name, "in", text)   # then save
     except Exception as e:
         print("webhook error:", e)
     return "ok", 200
@@ -158,7 +191,8 @@ LOGIN_HTML = """
 @app.route("/login", methods=["GET", "POST"])
 def login():
     if request.method == "POST":
-        if request.form.get("password") == ADMIN_PASSWORD:
+        sent = request.form.get("password", "")
+        if hmac.compare_digest(sent.encode(), ADMIN_PASSWORD.encode()):
             session["ok"] = True
             return redirect("/admin")
         return render_template_string(LOGIN_HTML, err="Wrong password")
@@ -207,48 +241,61 @@ options:{plugins:{legend:{display:false}}}});
 </script>
 """
 
+DB_ERROR_HTML = """
+<!doctype html><body style="font-family:sans-serif;max-width:420px;margin:80px auto">
+<h3>Database not reachable</h3>
+<p>Check the DATABASE_URL setting in Render, then refresh.</p>
+<p><a href="/logout">Logout</a></p></body>
+"""
+
 IST = "(created_at AT TIME ZONE 'Asia/Kolkata')"
 
 
 @app.route("/admin")
 @login_required
 def admin():
-    today_msgs = q(
-        f"SELECT count(*) FROM messages WHERE direction='in' AND {IST}::date=(now() AT TIME ZONE 'Asia/Kolkata')::date",
-        fetch=True,
-    )[0][0]
-    today_users = q(
-        f"SELECT count(DISTINCT phone) FROM messages WHERE direction='in' AND {IST}::date=(now() AT TIME ZONE 'Asia/Kolkata')::date",
-        fetch=True,
-    )[0][0]
-    total_users = q(
-        "SELECT count(DISTINCT phone) FROM messages WHERE direction='in'", fetch=True
-    )[0][0]
-    total_msgs = q(
-        "SELECT count(*) FROM messages WHERE direction='in'", fetch=True
-    )[0][0]
-    days = q(
-        f"""SELECT to_char({IST}::date,'DD Mon'), count(*) FROM messages
-            WHERE direction='in' AND created_at > now() - interval '7 days'
-            GROUP BY {IST}::date, 1 ORDER BY {IST}::date""",
-        fetch=True,
-    )
-    top_raw = q(
-        """SELECT text, count(*) FROM messages
-           WHERE direction='in' AND text ~ '^[0-9]{1,2}$'
-           GROUP BY text ORDER BY 2 DESC LIMIT 5""",
-        fetch=True,
-    )
-    top = []
-    for t, c in top_raw:
-        i = int(t)
-        if 1 <= i <= len(COURSES):
-            top.append((COURSES[i - 1][0], c))
-    recent = q(
-        f"""SELECT to_char({IST},'DD Mon HH24:MI'), phone, name, text
-            FROM messages WHERE direction='in' ORDER BY id DESC LIMIT 20""",
-        fetch=True,
-    )
+    try:
+        today_msgs = q(
+            f"SELECT count(*) FROM messages WHERE direction='in' AND {IST}::date=(now() AT TIME ZONE 'Asia/Kolkata')::date",
+            fetch=True,
+        )[0][0]
+        today_users = q(
+            f"SELECT count(DISTINCT phone) FROM messages WHERE direction='in' AND {IST}::date=(now() AT TIME ZONE 'Asia/Kolkata')::date",
+            fetch=True,
+        )[0][0]
+        total_users = q(
+            "SELECT count(DISTINCT phone) FROM messages WHERE direction='in'",
+            fetch=True,
+        )[0][0]
+        total_msgs = q(
+            "SELECT count(*) FROM messages WHERE direction='in'", fetch=True
+        )[0][0]
+        days = q(
+            f"""SELECT to_char({IST}::date,'DD Mon'), count(*) FROM messages
+                WHERE direction='in' AND created_at > now() - interval '7 days'
+                GROUP BY {IST}::date, 1 ORDER BY {IST}::date""",
+            fetch=True,
+        )
+        top_raw = q(
+            """SELECT text, count(*) FROM messages
+               WHERE direction='in' AND text ~ '^[0-9]{1,2}$'
+               GROUP BY text ORDER BY 2 DESC LIMIT 5""",
+            fetch=True,
+        )
+        top = []
+        for t, c in top_raw:
+            i = int(t)
+            if 1 <= i <= len(COURSES):
+                top.append((COURSES[i - 1][0], c))
+        recent = q(
+            f"""SELECT to_char({IST},'DD Mon HH24:MI'), phone, name, text
+                FROM messages WHERE direction='in' ORDER BY id DESC LIMIT 20""",
+            fetch=True,
+        )
+    except Exception as e:
+        print("admin db error:", e)
+        return render_template_string(DB_ERROR_HTML), 503
+
     return render_template_string(
         DASH_HTML,
         today_msgs=today_msgs,
